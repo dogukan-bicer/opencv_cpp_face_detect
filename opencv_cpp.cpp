@@ -1,182 +1,133 @@
 ﻿#include <opencv2/opencv.hpp>
-#include <opencv2/dnn.hpp> // DNN modülü için
-#include <windows.h>
+#include <opencv2/dnn.hpp>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <chrono>
 
-
 using namespace cv;
 using namespace std;
-using namespace dnn; // DNN isim alanını kullan
+using namespace dnn;
 
-const double TOLERANCE = 25000;    // Yüz karşılaştırma toleransı
-const int FRAME_THICKNESS = 3;
-const int FONT_THICKNESS = 2;
+const double CONFIDENCE_THRESHOLD = 0.5;
+const double NMS_THRESHOLD = 0.1;
+const int FRAME_THICKNESS = 2;  // Çerçeve kalınlığı ayarı
+const int FONT_THICKNESS = 2;   // Yazı kalınlığı
+const int MAX_WIDTH = 600;
 
-// DNN model dosyalarının yolu
-const string model = "res10_300x300_ssd_iter_140000.caffemodel";
-const string config = "deploy.prototxt";
+// Darknet model dosyalarının yolları
+const string model = "yolov4-tiny-obj_final.weights";
+const string config = "yolov4-tiny-obj.cfg";
+const string coco_names = "coco.names";
 
-vector<string> GetFilesInDirectory(const string& dir) {
-    vector<string> files;
-    WIN32_FIND_DATAA file_data;  // 'A' versiyonu, dar karakterli
-    HANDLE hFind = FindFirstFileA((dir + "\\*").c_str(), &file_data);  // 'A' versiyonu, dar karakterli
-
-    if (hFind == INVALID_HANDLE_VALUE) {
-        cerr << "Klasör bulunamadı: " << dir << endl;
-        return files;
-    }
-
-    do {
-        const string file_name = file_data.cFileName;  // Dosya adı
-        const string full_file_name = dir + "\\" + file_name;
-        const bool is_directory = (file_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-        if (file_name[0] == '.') {
-            continue;  // Gizli dosyaları atla
-        }
-
-        if (!is_directory) {
-            files.push_back(full_file_name);  // Dosya adını listeye ekle
-        }
-    } while (FindNextFileA(hFind, &file_data) != 0);  // 'A' versiyonu, dar karakterli
-
-    FindClose(hFind);
-    return files;
+vector<string> loadClassNames(const string& file_path) {
+    vector<string> class_names;
+    ifstream ifs(file_path.c_str());
+    string line;
+    while (getline(ifs, line)) class_names.push_back(line);
+    return class_names;
 }
 
 int main() {
-    // DNN modeli yükle
-    Net net = readNetFromCaffe(config, model);
-    if (net.empty()) {
-        cerr << "Yuz algılayıcı yüklenemedi!" << endl;
-        return -1;
-    }
+    vector<string> class_names = loadClassNames(coco_names);
+    Net net = readNetFromDarknet(config, model);
+    net.setPreferableBackend(DNN_BACKEND_OPENCV);
+    net.setPreferableTarget(DNN_TARGET_CPU);
 
-    cout << "Opencv kutuphanesi yuklendi!!!\n";
-    cout << CV_VERSION << std::endl;
-
-    // Yüz veritabanı için örnek resimler ve etiketler
-    vector<Mat> known_faces;
-    vector<string> known_names;
-
-    // Dostların yüz verilerini yükle
-    string known_faces_dir = "dostlar";
-    vector<string> files = GetFilesInDirectory(known_faces_dir);
-
-    for (const string& file_path : files) {
-        Mat img = imread(file_path, IMREAD_COLOR);  // Renkli olarak yükle
-        if (!img.empty()) {
-            // Yüz ROI'yi algıla ve veritabanına ekle
-            Mat blob = blobFromImage(img, 1.0, Size(300, 300), Scalar(104, 117, 123), false, false);
-            net.setInput(blob);
-            Mat detections = net.forward();
-
-            // Detections matrisinden verileri al
-            const float* data = detections.ptr<float>();
-            for (int i = 0; i < detections.size[2]; i++) {
-                float confidence = data[i * 7 + 2]; // Güven eşiği
-                if (confidence > 0.5) { // Güven eşiği
-                    int x1 = static_cast<int>(data[i * 7 + 3] * img.cols);
-                    int y1 = static_cast<int>(data[i * 7 + 4] * img.rows);
-                    int x2 = static_cast<int>(data[i * 7 + 5] * img.cols);
-                    int y2 = static_cast<int>(data[i * 7 + 6] * img.rows);
-
-                    Mat faceROI = img(Rect(Point(x1, y1), Point(x2, y2)));  // Yüz ROI
-                    known_faces.push_back(faceROI);
-                    string file_name = file_path.substr(file_path.find_last_of("\\") + 1);
-                    known_names.push_back(file_name.substr(0, file_name.find_last_of(".")));
-                    cout << "Tespit edilecek yuz: " << known_names.back() << std::endl;
-                }
-            }
-        }
-    }
-
-    // Web kamerasını başlat
     VideoCapture video_capture(0);
     if (!video_capture.isOpened()) {
-        cerr << "Web kamerası açılamadı!" << endl;
+        cerr << " webcam acilmiyor!" << endl;
         return -1;
     }
 
-    cout << "Gercek zamanli yuz tanima basliyor..." << endl;
+    // Webcam çözünürlüğünü artırma
+    video_capture.set(CAP_PROP_FRAME_WIDTH, 1280);
+    video_capture.set(CAP_PROP_FRAME_HEIGHT, 720);
 
-    // FPS hesaplamak için zamanlayıcı
+    cout << "Gercek zamanlı goruntu tespiti Basliyor..." << endl;
     auto start_time = chrono::steady_clock::now();
     int frame_count = 0;
+    double fps = 0.0;
 
     while (true) {
         Mat frame;
         video_capture >> frame;
-
         if (frame.empty()) break;
 
-        // Yüzleri algıla
-        Mat blob = blobFromImage(frame, 1.0, Size(300, 300), Scalar(104, 117, 123), false, false);
+        Mat blob = blobFromImage(frame, 1 / 255.0, Size(416, 416), Scalar(0, 0, 0), true, false);
         net.setInput(blob);
-        Mat detections = net.forward();
 
-        // Detections matrisinden verileri al
-        const float* data = detections.ptr<float>();
-        for (int i = 0; i < detections.size[2]; i++) {
-            float confidence = data[i * 7 + 2];
-            if (confidence > 0.5) { // Güven eşiği
-                int x1 = static_cast<int>(data[i * 7 + 3] * frame.cols);
-                int y1 = static_cast<int>(data[i * 7 + 4] * frame.rows);
-                int x2 = static_cast<int>(data[i * 7 + 5] * frame.cols);
-                int y2 = static_cast<int>(data[i * 7 + 6] * frame.rows);
+        vector<Mat> outputs;
+        net.forward(outputs, net.getUnconnectedOutLayersNames());
 
-                Mat faceROI = frame(Rect(Point(x1, y1), Point(x2, y2))); // ROI'yi al
+        vector<int> class_ids;
+        vector<float> confidences;
+        vector<Rect> boxes;
 
-                // Yüzü karşılaştır
-                string name = "Bilinmeyen";
-                double best_confidence = 1.0;  // En düşük benzerlik skoru
-                double confidence_percentage = 0.0;
+        // Çıkış katmanı analizi
+        for (auto& output : outputs) {
+            for (int i = 0; i < output.rows; i++) {
+                float confidence = output.at<float>(i, 4);
+                if (confidence > CONFIDENCE_THRESHOLD) {
+                    Mat scores = output.row(i).colRange(5, output.cols);
+                    Point class_id_point;
+                    double max_class_score;
+                    minMaxLoc(scores, 0, &max_class_score, 0, &class_id_point);
+                    if (max_class_score > CONFIDENCE_THRESHOLD) {
+                        int width = static_cast<int>(output.at<float>(i, 2) * frame.cols);
+                        if (width < MAX_WIDTH)
+                        {
+                            int center_x = static_cast<int>(output.at<float>(i, 0) * frame.cols);
+                            int center_y = static_cast<int>(output.at<float>(i, 1) * frame.rows);
+                            int height = static_cast<int>(output.at<float>(i, 3) * frame.rows);
+                            int left = center_x - width / 2;
+                            int top = center_y - height / 2;
 
-                for (size_t i = 0; i < known_faces.size(); i++) {
-                    Mat known_face_resized;
-                    resize(known_faces[i], known_face_resized, faceROI.size());
-                    double confidence = norm(known_face_resized, faceROI, NORM_L2);
-                    confidence_percentage = -100.0 * (1 - confidence / TOLERANCE); // Yüzde olarak hesapla
-                    if (confidence > TOLERANCE) {
-                        name = known_names[i];
-                        break; // Eşleşme bulunduğunda döngüyü kır
+                            class_ids.push_back(class_id_point.x);
+                            confidences.push_back(static_cast<float>(max_class_score));
+                            boxes.push_back(Rect(left, top, width, height));
+                        }
+
                     }
                 }
-
-                // Çerçeve rengini belirle
-                Scalar color = (name == "Bilinmeyen") ? Scalar(0, 0, 255) : Scalar(0, 255, 0); // Kırmızı veya yeşil
-
-                // Yüzü kare içine alın ve isim yazın
-                rectangle(frame, Rect(Point(x1, y1), Point(x2, y2)), color, FRAME_THICKNESS);
-                putText(frame, name, Point(x1, y1 - 10), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), FONT_THICKNESS);
-                putText(frame, to_string(confidence_percentage) + "%", Point(x1, y2 + 10), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), FONT_THICKNESS);
             }
         }
 
-        // FPS hesapla
+        // NMS ile gereksiz kareleri ortadan kaldırma
+        vector<int> indices;
+        NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD, indices);
+
+        
+
+        // Eğer geçerli bir nesne algılandıysa kare çiz
+        if (!indices.empty()) {
+            for (int idx : indices) {
+                Rect box = boxes[idx];
+                rectangle(frame, box, Scalar(0, 255, 0), FRAME_THICKNESS);
+
+                string label = class_names[class_ids[idx]] + " (" + to_string(static_cast<int>(confidences[idx] * 100)) + "%)";
+                int baseline;
+                Size label_size = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.6, FONT_THICKNESS, &baseline);
+                rectangle(frame, Point(box.x, box.y - label_size.height - 10), Point(box.x + label_size.width, box.y), Scalar(0, 255, 0), FILLED);
+                putText(frame, label, Point(box.x, box.y - 5), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), FONT_THICKNESS);
+            }
+        }
+
         frame_count++;
         auto end_time = chrono::steady_clock::now();
         double elapsed_time = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count();
-        if (elapsed_time > 1000) { // 1 saniyede bir FPS güncelle
-            double fps = frame_count / (elapsed_time / 1000.0);
+        if (elapsed_time > 1000) {
+            fps = frame_count / (elapsed_time / 1000.0);
             frame_count = 0;
             start_time = end_time;
-
-            // FPS değerini ekranda göster
-            putText(frame, "FPS: " + to_string(static_cast<int>(fps)), Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), FONT_THICKNESS);
         }
 
-        // FPS değerini sürekli güncelle
-        putText(frame, "FPS: " + to_string(static_cast<int>(frame_count * 1000.0 / elapsed_time)), Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), FONT_THICKNESS);
+        // FPS bilgisini ekrana yazdır
+        putText(frame, "FPS: " + to_string(static_cast<int>(fps)), Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), FONT_THICKNESS);
 
-        // Görüntüyü göster
-        imshow("Yuz Tanima", frame);
-
-        // Çıkış tuşu
-        if (waitKey(1) == 27) break; // ESC tuşu ile çık
+        imshow("Nesne tespiti", frame);
+        if (waitKey(1) == 27) break;  // Çıkmak için 'Esc' tuşuna basın
     }
 
     video_capture.release();
